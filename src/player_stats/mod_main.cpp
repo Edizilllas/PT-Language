@@ -23,14 +23,19 @@
 #include <rex/system/mod_plugin.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
 
 #include <imgui.h>
 
+#include <rex/logging.h>
 #include <rex/memory/utils.h>
+#include <rex/ppc/context.h>
 #include <rex/runtime.h>
+#include <rex/system/function_dispatcher.h>
+#include <rex/system/kernel_state.h>
 #include <rex/system/mod_registry.h>
 #include <rex/system/xmemory.h>
 #include <rex/ui/imgui_dialog.h>
@@ -88,6 +93,74 @@ std::string ToHex(uint64_t value, int width) {
   return buf;
 }
 
+// "Level Up" button state -- set from the ImGui overlay (host/render thread)
+// and consumed from the hooked app.fixed_timestep_tick_fn (guest thread),
+// mirroring mods_src/resolution_preset_native's cross-thread request
+// pattern: the overlay can't safely call a guest function or touch a
+// PPCContext itself, so it just flags a request and a per-frame guest-side
+// hook picks it up on its next tick, where a real, valid PPCContext exists.
+std::atomic<bool> g_levelup_requested{false};
+
+uint32_t g_stats_addr = 0;
+uint32_t g_exp_table_addr = 0;
+PPCFunc* g_level_up_tick_fn = nullptr;
+PPCFunc* g_original_perframe_fn = nullptr;
+
+// Applies exactly one real, in-game level-up by writing exp up to the
+// current level's threshold (see kExpToLevelTableAddrVanilla in
+// mods_src/game_symbols) and calling the game's own level-up tick function
+// (player.level_up_tick_fn) -- NOT a fabricated stat write. That function
+// rolls HP/MP max growth and a random subset of STR/CON/INT/LCK itself,
+// exactly like a real exp-triggered level-up, so other stats moving besides
+// LEVEL is expected.
+void ApplyPendingLevelUp(PPCContext& ctx, uint8_t* base) {
+  if (!g_stats_addr || !g_exp_table_addr || !g_level_up_tick_fn) {
+    return;
+  }
+  auto* ks = rex::system::kernel_state();
+  auto* memory = ks ? ks->memory() : nullptr;
+  if (!memory) {
+    return;
+  }
+
+  uint32_t level = ReadGuestU32BE(memory, g_stats_addr + kLevelOffset);
+  if (level >= 99) {
+    REXLOG_INFO("[player_stats] Level Up requested at max level (99); ignoring");
+    return;
+  }
+
+  uint32_t needed = ReadGuestU32BE(memory, g_exp_table_addr + level * 4);
+  uint32_t exp = ReadGuestU32BE(memory, g_stats_addr + kExpOffset);
+  if (exp < needed) {
+    WriteGuestU32BE(memory, g_stats_addr + kExpOffset, needed);
+  }
+
+  g_level_up_tick_fn(ctx, base);
+
+  uint32_t new_level = ReadGuestU32BE(memory, g_stats_addr + kLevelOffset);
+  REXLOG_INFO("[player_stats] Level Up: {} -> {}", level, new_level);
+}
+
+// Hooks render.per_frame_conversion_fn (ticks every frame during actual 3D
+// gameplay rendering -- not app.fixed_timestep_tick_fn, which is already
+// claimed by NocturneRecomp's own built-in src/graphics_settings.cpp and
+// can't be double-overridden) purely to get a live, valid PPCContext to
+// call player.level_up_tick_fn from -- same trick as
+// mods_src/resolution_preset_native's ResolutionPresetNative_PerFrame. Full
+// context snapshot/restore around the excursion since this is an unplanned
+// nested call the compiler didn't account for.
+extern "C" void PlayerStats_PerFrame(PPCContext& ctx, uint8_t* base) {
+  if (g_levelup_requested.exchange(false)) {
+    PPCContext saved = ctx;
+    ApplyPendingLevelUp(ctx, base);
+    ctx = saved;
+  }
+
+  if (g_original_perframe_fn) {
+    g_original_perframe_fn(ctx, base);
+  }
+}
+
 class PlayerStatsDialog : public rex::ui::ImGuiDialog {
  public:
   PlayerStatsDialog(rex::ui::ImGuiDrawer* drawer, rex::Runtime* runtime)
@@ -116,6 +189,9 @@ class PlayerStatsDialog : public rex::ui::ImGuiDialog {
         clear_flag_addr_ = *addr;
         clear_flag_addr_resolved_ = true;
       }
+    }
+    if (addr_resolved_) {
+      g_stats_addr = addr_;
     }
   }
 
@@ -198,6 +274,12 @@ class PlayerStatsDialog : public rex::ui::ImGuiDialog {
         edit_rooms_ = static_cast<int>(rooms);
       }
     }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(level >= 99);
+    if (ImGui::Button("Level Up")) {
+      g_levelup_requested.store(true, std::memory_order_release);
+    }
+    ImGui::EndDisabled();
     ImGui::Separator();
 
     if (!edit_mode_) {
@@ -372,11 +454,57 @@ class PlayerStatsMod : public rex::system::IModPlugin {
     if (dialog_) {
       dialog_->ResolveAddress();
     }
+    if (!runtime_ || !runtime_->mod_registry() || !runtime_->function_dispatcher()) {
+      return;
+    }
+    auto* dispatcher = runtime_->function_dispatcher();
+    auto* registry = runtime_->mod_registry();
+
+    if (auto addr = registry->FindAddress("player.exp_to_level_table")) {
+      g_exp_table_addr = *addr;
+    }
+    if (auto addr = registry->FindAddress("player.level_up_tick_fn")) {
+      g_level_up_tick_fn = dispatcher->GetFunction(*addr);
+    }
+    if (!g_exp_table_addr || !g_level_up_tick_fn) {
+      REXLOG_WARN(
+          "[player_stats] player.exp_to_level_table/player.level_up_tick_fn not published; "
+          "Level Up button will do nothing");
+    }
+
+    // render.per_frame_conversion_fn, not app.fixed_timestep_tick_fn: the
+    // latter is already claimed by NocturneRecomp's own built-in
+    // src/graphics_settings.cpp (OverrideFunction is exclusive, so a second
+    // claim on the same address always fails). This address is unclaimed
+    // and, per game_symbols' own caveat, only ticks during actual 3D
+    // gameplay rendering -- which is exactly when leveling up makes sense
+    // anyway (not while a menu is open).
+    if (auto addr = registry->FindAddress("render.per_frame_conversion_fn")) {
+      perframe_addr_ = *addr;
+      if (!dispatcher->OverrideFunction(perframe_addr_, &PlayerStats_PerFrame,
+                                        &g_original_perframe_fn)) {
+        REXLOG_WARN("[player_stats] OverrideFunction failed for {:08X} (per-frame); "
+                    "Level Up button will do nothing",
+                    perframe_addr_);
+        perframe_addr_ = 0;
+      }
+    } else {
+      REXLOG_WARN(
+          "[player_stats] render.per_frame_conversion_fn not published; Level Up button will "
+          "do nothing");
+    }
+  }
+
+  void OnShutdown() override {
+    if (perframe_addr_ && runtime_ && runtime_->function_dispatcher()) {
+      runtime_->function_dispatcher()->RestoreFunction(perframe_addr_, g_original_perframe_fn);
+    }
   }
 
  private:
   rex::Runtime* runtime_ = nullptr;
   std::unique_ptr<PlayerStatsDialog> dialog_;
+  uint32_t perframe_addr_ = 0;
 };
 
 }  // namespace
