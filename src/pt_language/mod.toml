@@ -1,0 +1,6 @@
+manifest_version = 1
+name = "Portuguese Language"
+version = "1.0.0"
+description = "Tradução para o Menu Arcade do Xbox 360, não afeta o jogo em geral."
+code = "pt_language"
+platform = "windows-x64"
