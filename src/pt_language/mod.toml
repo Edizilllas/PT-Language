@@ -1,6 +1,6 @@
 manifest_version = 2
 name = "Portuguese Language"
-version = "1.0.0"
+version = "1.0.1"
 author = "Ed1z_19"
 description = "Tradução para o Menu Arcade do Xbox 360, não afeta o jogo em geral."
 code = "pt_language"
